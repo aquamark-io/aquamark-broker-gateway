@@ -278,10 +278,13 @@ app.post('/inbound', async (req, res) => {
       const result = await watermarkResponse.json();
       const jobId = result.job_id;
       
-      logger.info(`Polling job ${jobId}`);
+      logger.info(`Job created: ${jobId}, polling for completion`);
       const downloadUrl = await pollJobCompletion(jobId);
       
+      logger.info(`Job complete, downloading from: ${downloadUrl}`);
       const brokerWatermarkedFiles = await downloadAndExtractFiles(downloadUrl);
+      
+      logger.info(`Downloaded ${brokerWatermarkedFiles.length} file(s)`);
       
       const finalFiles = [];
       
@@ -328,7 +331,11 @@ app.post('/inbound', async (req, res) => {
       });
       
     } catch (error) {
-      logger.error('Processing error:', error.message);
+      logger.error('Processing error:', { 
+        message: error.message,
+        stack: error.stack,
+        name: error.name
+      });
       return res.status(500).json({ error: error.message });
     }
     
