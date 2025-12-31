@@ -199,7 +199,9 @@ app.post('/inbound', async (req, res) => {
     
     const emailData = req.body;
     const recipientEmail = emailData.ToFull?.[0]?.Email || emailData.To;
-    const brokerIdMatch = recipientEmail.match(/^broker-([^@]+)@/);
+    
+    // Extract broker ID from email: bearfinancial@broker-gateway.aquamark.io -> bearfinancial
+    const brokerIdMatch = recipientEmail.match(/^([^@]+)@broker-gateway\.aquamark\.io$/i);
     
     if (!brokerIdMatch) {
       logger.error(`Invalid email format: ${recipientEmail}`);
@@ -399,5 +401,5 @@ async function downloadAndExtractFiles(downloadUrl) {
 app.listen(PORT, '0.0.0.0', () => {
   logger.info(`Broker Email Gateway running on port ${PORT}`);
   console.log(`🚀 Aquamark Broker Email Gateway on port ${PORT}`);
-  console.log(`📧 Ready at broker-{id}@gateway.aquamark.io`);
+  console.log(`📧 Ready at {broker-id}@broker-gateway.aquamark.io`);
 });
