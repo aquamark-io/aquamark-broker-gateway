@@ -95,7 +95,7 @@ const WATERMARK_POSITIONS = [
 ];
 
 function getCenteredWatermarkText(container, textWidth, textHeight) {
-  const textX = container.x + (container.containerWidth - textWidth) / 2 + 20 - 72; // Moved 72 points (1 inch) left
+  const textX = container.x + (container.containerWidth - textWidth) / 2 + 20 - 36; // Moved 36 points (0.5 inch) left
   const textY = container.y + (container.containerHeight - textHeight) / 2;
   return { textX, textY };
 }
@@ -185,6 +185,17 @@ async function addFunderWatermark(pdfBuffer, funderName) {
   const { PDFName, PDFString } = require('pdf-lib');
   const infoDict = pdfDoc.getInfoDict();
   infoDict.set(PDFName.of('AquamarkFunder'), PDFString.of(funderName));
+  
+  // Add to keywords
+  const existingKeywords = infoDict.get(PDFName.of('Keywords'));
+  const keywordsText = existingKeywords ? existingKeywords.toString().replace(/^\(|\)$/g, '') : '';
+  
+  const funderKeyword = `AquamarkFunder: ${funderName}`;
+  const newKeywords = keywordsText 
+    ? `${keywordsText}, ${funderKeyword}`
+    : funderKeyword;
+  
+  infoDict.set(PDFName.of('Keywords'), PDFString.of(newKeywords));
   
   return await pdfDoc.save({ updateMetadata: false });
 }
