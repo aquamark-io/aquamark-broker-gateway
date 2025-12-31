@@ -277,7 +277,8 @@ app.post('/inbound', async (req, res) => {
         },
         body: JSON.stringify({
           user_email: broker.source_email,
-          files: files
+          files: files,
+          skip_usage_tracking: true // Gateway will track usage instead
         })
       });
       
@@ -315,7 +316,7 @@ app.post('/inbound', async (req, res) => {
       let totalPageCount = 0;
       
       if (funderNames.length === 0) {
-        // No funders - just use broker-watermarked files
+        // No funders - count broker-watermarked files
         for (const file of brokerWatermarkedFiles) {
           const pdfBuffer = Buffer.from(file.Content, 'base64');
           const pdfDoc = await PDFDocument.load(pdfBuffer, { updateMetadata: false });
@@ -323,7 +324,7 @@ app.post('/inbound', async (req, res) => {
         }
         finalFiles.push(...brokerWatermarkedFiles);
       } else {
-        // Add funder watermarks
+        // With funders - only count the final funder-watermarked files
         for (const file of brokerWatermarkedFiles) {
           const pdfBuffer = Buffer.from(file.Content, 'base64');
           const baseName = file.Name.replace(/\.pdf$/i, '').replace(/-protected$/i, '');
@@ -335,7 +336,7 @@ app.post('/inbound', async (req, res) => {
             const funderSlug = funderName.substring(0, MAX_FUNDER_NAME_LENGTH)
               .replace(/\s+/g, '-').toLowerCase();
             
-            // Count pages
+            // Count pages ONLY for funder files
             const pdfDoc = await PDFDocument.load(funderPdf, { updateMetadata: false });
             totalPageCount += pdfDoc.getPageCount();
             
