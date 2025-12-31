@@ -1,8 +1,7 @@
 FROM node:20-slim
 
-# Install qpdf and dependencies for canvas/sharp
+# Install dependencies for sharp
 RUN apt-get update && apt-get install -y \
-    qpdf \
     libcairo2-dev \
     libpango1.0-dev \
     libjpeg-dev \
