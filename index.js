@@ -95,7 +95,7 @@ const WATERMARK_POSITIONS = [
 ];
 
 function getCenteredWatermarkText(container, textWidth, textHeight) {
-  const textX = container.x + (container.containerWidth - textWidth) / 2 + 20;
+  const textX = container.x + (container.containerWidth - textWidth) / 2 + 20 - 72; // Moved 72 points (1 inch) left
   const textY = container.y + (container.containerHeight - textHeight) / 2;
   return { textX, textY };
 }
@@ -272,7 +272,21 @@ app.post('/inbound', async (req, res) => {
       
       if (!watermarkResponse.ok) {
         const errorText = await watermarkResponse.text();
-        throw new Error(`Broker API failed: ${errorText}`);
+        logger.error('Broker API error:', { 
+          status: watermarkResponse.status, 
+          response: errorText.substring(0, 500) 
+        });
+        throw new Error(`Broker API failed with status ${watermarkResponse.status}`);
+      }
+      
+      const contentType = watermarkResponse.headers.get('content-type');
+      if (!contentType || !contentType.includes('application/json')) {
+        const textResponse = await watermarkResponse.text();
+        logger.error('Broker API returned non-JSON:', { 
+          contentType, 
+          response: textResponse.substring(0, 500) 
+        });
+        throw new Error('Broker API returned invalid response (not JSON)');
       }
       
       const result = await watermarkResponse.json();
@@ -287,10 +301,18 @@ app.post('/inbound', async (req, res) => {
       logger.info(`Downloaded ${brokerWatermarkedFiles.length} file(s)`);
       
       const finalFiles = [];
+      let totalPageCount = 0;
       
       if (funderNames.length === 0) {
+        // No funders - just use broker-watermarked files
+        for (const file of brokerWatermarkedFiles) {
+          const pdfBuffer = Buffer.from(file.Content, 'base64');
+          const pdfDoc = await PDFDocument.load(pdfBuffer, { updateMetadata: false });
+          totalPageCount += pdfDoc.getPageCount();
+        }
         finalFiles.push(...brokerWatermarkedFiles);
       } else {
+        // Add funder watermarks
         for (const file of brokerWatermarkedFiles) {
           const pdfBuffer = Buffer.from(file.Content, 'base64');
           const baseName = file.Name.replace(/\.pdf$/i, '').replace(/-protected$/i, '');
@@ -301,6 +323,10 @@ app.post('/inbound', async (req, res) => {
             const funderPdf = await addFunderWatermark(pdfBuffer, funderName);
             const funderSlug = funderName.substring(0, MAX_FUNDER_NAME_LENGTH)
               .replace(/\s+/g, '-').toLowerCase();
+            
+            // Count pages
+            const pdfDoc = await PDFDocument.load(funderPdf, { updateMetadata: false });
+            totalPageCount += pdfDoc.getPageCount();
             
             finalFiles.push({
               Name: `${baseName}-${funderSlug}.pdf`,
@@ -322,6 +348,9 @@ app.post('/inbound', async (req, res) => {
         TextBody: 'Your watermarked documents are attached.',
         Attachments: finalFiles
       });
+      
+      // Track usage
+      await trackUsage(broker.source_email, finalFiles.length, totalPageCount);
       
       logger.info('Email sent successfully');
       
@@ -403,6 +432,51 @@ async function downloadAndExtractFiles(downloadUrl) {
       Content: entry.getData().toString('base64'),
       ContentType: 'application/pdf'
     }));
+}
+
+async function trackUsage(userEmail, fileCount, pageCount) {
+  try {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth() + 1;
+    
+    const { data: existing } = await supabase
+      .from('broker_monthly_usage')
+      .select('*')
+      .eq('user_email', userEmail)
+      .eq('year', year)
+      .eq('month', month)
+      .single();
+    
+    if (existing) {
+      await supabase
+        .from('broker_monthly_usage')
+        .update({
+          file_count: existing.file_count + fileCount,
+          page_count: existing.page_count + pageCount,
+          updated_at: now.toISOString()
+        })
+        .eq('user_email', userEmail)
+        .eq('year', year)
+        .eq('month', month);
+    } else {
+      await supabase
+        .from('broker_monthly_usage')
+        .insert({
+          user_email: userEmail,
+          year,
+          month,
+          file_count: fileCount,
+          page_count: pageCount,
+          created_at: now.toISOString(),
+          updated_at: now.toISOString()
+        });
+    }
+    
+    logger.info(`Usage tracked: ${fileCount} files, ${pageCount} pages`);
+  } catch (error) {
+    logger.error('Usage tracking error:', error.message);
+  }
 }
 
 app.listen(PORT, '0.0.0.0', () => {
