@@ -10,6 +10,7 @@ const fetch = require('node-fetch');
 const { PDFDocument } = require('pdf-lib');
 const sharp = require('sharp');
 const AdmZip = require('adm-zip');
+const AbortController = require('abort-controller');
 
 // Initialize logger
 const logger = winston.createLogger({
@@ -39,10 +40,11 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Rate limiting
+// Rate limiting - 100 emails per hour (25 per 15 min)
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100
+  max: 25,
+  message: { error: 'Too many requests, please try again later' }
 });
 app.use('/inbound', limiter);
 
@@ -56,6 +58,9 @@ const supabase = createClient(
 const postmarkClient = new postmark.ServerClient(process.env.POSTMARK_API_KEY);
 
 const MAX_FUNDER_NAME_LENGTH = 20;
+const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB in bytes
+const MAX_TOTAL_SIZE = 25 * 1024 * 1024; // 25MB total
+const FETCH_TIMEOUT = 60000; // 60 seconds
 const textImageCache = new Map();
 const MAX_TEXT_CACHE_SIZE = 1000;
 
@@ -77,6 +82,56 @@ function getWithLRURefresh(cache, key) {
   return value;
 }
 
+// Sanitize funder name to prevent XSS/injection
+function sanitizeFunderName(name) {
+  if (!name || typeof name !== 'string') return '';
+  
+  // Remove any HTML/script tags, special chars that could cause issues
+  return name
+    .replace(/<[^>]*>/g, '') // Remove HTML tags
+    .replace(/[<>'"&]/g, '') // Remove potential injection chars
+    .substring(0, MAX_FUNDER_NAME_LENGTH)
+    .trim();
+}
+
+// Validate PDF buffer
+async function isValidPDF(buffer) {
+  try {
+    const pdfDoc = await PDFDocument.load(buffer, { 
+      updateMetadata: false,
+      ignoreEncryption: true 
+    });
+    return pdfDoc.getPageCount() > 0;
+  } catch (error) {
+    logger.warn('PDF validation failed:', error.message);
+    return false;
+  }
+}
+
+// Send error notification email
+async function sendErrorEmail(destinationEmail, errorMessage, fileDetails = '') {
+  try {
+    await postmarkClient.sendEmail({
+      From: 'Aquamark <gateway@aquamark.io>',
+      To: destinationEmail,
+      Subject: 'Watermarking Error - Action Required',
+      TextBody: `We encountered an error processing your watermark request:
+
+${errorMessage}
+
+${fileDetails ? `Details: ${fileDetails}` : ''}
+
+Please check your files and try again. If the issue persists, contact support@aquamark.io.
+
+- Aquamark Team`,
+      MessageStream: 'outbound'
+    });
+    logger.info('Error notification sent');
+  } catch (error) {
+    logger.error('Failed to send error email:', error.message);
+  }
+}
+
 // Watermark positions
 const WATERMARK_POSITIONS = [
   { x: -37, y: 9, containerWidth: 200, containerHeight: 130 },
@@ -95,7 +150,7 @@ const WATERMARK_POSITIONS = [
 ];
 
 function getCenteredWatermarkText(container, textWidth, textHeight) {
-  const textX = container.x + (container.containerWidth - textWidth) / 2 + 20 - 36; // Moved 36 points (0.5 inch) left
+  const textX = container.x + (container.containerWidth - textWidth) / 2 + 20 - 36;
   const textY = container.y + (container.containerHeight - textHeight) / 2;
   return { textX, textY };
 }
@@ -186,7 +241,6 @@ async function addFunderWatermark(pdfBuffer, funderName) {
   const infoDict = pdfDoc.getInfoDict();
   infoDict.set(PDFName.of('AquamarkFunder'), PDFString.of(funderName));
   
-  // Add to keywords
   const existingKeywords = infoDict.get(PDFName.of('Keywords'));
   const keywordsText = existingKeywords ? existingKeywords.toString().replace(/^\(|\)$/g, '') : '';
   
@@ -200,18 +254,41 @@ async function addFunderWatermark(pdfBuffer, funderName) {
   return await pdfDoc.save({ updateMetadata: false });
 }
 
+// Fetch with timeout
+async function fetchWithTimeout(url, options = {}, timeout = FETCH_TIMEOUT) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      throw new Error('Request timeout');
+    }
+    throw error;
+  }
+}
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'aquamark-broker-gateway' });
 });
 
 app.post('/inbound', async (req, res) => {
+  let broker = null;
+  
   try {
     logger.info('Received inbound email');
     
     const emailData = req.body;
     const recipientEmail = emailData.ToFull?.[0]?.Email || emailData.To;
     
-    // Extract broker ID from email: bearfinancial@broker-gateway.aquamark.io -> bearfinancial
+    // Extract broker ID from email
     const brokerIdMatch = recipientEmail.match(/^([^@]+)@broker-gateway\.aquamark\.io$/i);
     
     if (!brokerIdMatch) {
@@ -222,30 +299,40 @@ app.post('/inbound', async (req, res) => {
     const brokerId = brokerIdMatch[1];
     logger.info(`Processing for broker: ${brokerId}`);
     
-    const { data: broker, error: brokerError } = await supabase
+    const { data: brokerData, error: brokerError } = await supabase
       .from('broker_gateway_users')
       .select('*')
       .eq('broker_id', brokerId)
       .eq('active', true)
       .single();
     
-    if (brokerError || !broker) {
+    if (brokerError || !brokerData) {
       logger.error(`Broker not found: ${brokerId}`);
       return res.status(404).json({ error: 'Broker not found' });
     }
     
-    const senderEmail = emailData.From || emailData.FromFull?.Email;
-    if (senderEmail !== broker.source_email) {
+    broker = brokerData;
+    
+    // Case-insensitive email comparison
+    const senderEmail = (emailData.From || emailData.FromFull?.Email || '').toLowerCase();
+    const authorizedEmail = (broker.source_email || '').toLowerCase();
+    
+    if (senderEmail !== authorizedEmail) {
       logger.warn(`Unauthorized sender: ${senderEmail}`);
       return res.status(403).json({ error: 'Unauthorized' });
     }
     
     logger.info(`Found broker: ${broker.company_name}`);
     
+    // Parse and sanitize funder names from subject
     const subject = emailData.Subject || '';
-    const funderNames = subject.trim() 
+    const rawFunderNames = subject.trim() 
       ? subject.split(',').map(f => f.trim()).filter(f => f.length > 0)
       : [];
+    
+    const funderNames = rawFunderNames
+      .map(name => sanitizeFunderName(name))
+      .filter(name => name.length > 0);
     
     logger.info(`Funders: ${funderNames.length > 0 ? funderNames.join(', ') : 'none'}`);
     
@@ -256,20 +343,87 @@ app.post('/inbound', async (req, res) => {
     
     if (pdfAttachments.length === 0) {
       logger.warn('No PDF attachments');
+      await sendErrorEmail(
+        broker.destination_email,
+        'No PDF attachments found in your email.',
+        'Please attach PDF files and try again.'
+      );
       return res.status(200).json({ message: 'No PDFs to process' });
+    }
+    
+    // Validate file sizes
+    let totalSize = 0;
+    const oversizedFiles = [];
+    
+    for (const att of pdfAttachments) {
+      const fileSize = Buffer.from(att.Content, 'base64').length;
+      totalSize += fileSize;
+      
+      if (fileSize > MAX_FILE_SIZE) {
+        oversizedFiles.push(`${att.Name} (${(fileSize / 1024 / 1024).toFixed(2)}MB)`);
+      }
+    }
+    
+    if (oversizedFiles.length > 0) {
+      logger.error(`Files exceed 25MB limit: ${oversizedFiles.join(', ')}`);
+      await sendErrorEmail(
+        broker.destination_email,
+        'One or more files exceed the 25MB size limit.',
+        `Files too large: ${oversizedFiles.join(', ')}\n\nMaximum file size: 25MB per file`
+      );
+      return res.status(413).json({ error: 'File size limit exceeded' });
+    }
+    
+    if (totalSize > MAX_TOTAL_SIZE) {
+      logger.error(`Total size exceeds 25MB: ${(totalSize / 1024 / 1024).toFixed(2)}MB`);
+      await sendErrorEmail(
+        broker.destination_email,
+        'Total attachment size exceeds 25MB limit.',
+        `Total size: ${(totalSize / 1024 / 1024).toFixed(2)}MB\nMaximum total size: 25MB`
+      );
+      return res.status(413).json({ error: 'Total size limit exceeded' });
     }
     
     logger.info(`Processing ${pdfAttachments.length} PDF(s)`);
     
-    const files = pdfAttachments.map(att => ({
-      name: att.Name,
-      data: att.Content
-    }));
+    // Validate PDFs before sending to API
+    const validFiles = [];
+    const corruptedFiles = [];
+    
+    for (const att of pdfAttachments) {
+      const pdfBuffer = Buffer.from(att.Content, 'base64');
+      const isValid = await isValidPDF(pdfBuffer);
+      
+      if (isValid) {
+        validFiles.push({
+          name: att.Name,
+          data: att.Content
+        });
+      } else {
+        corruptedFiles.push(att.Name);
+      }
+    }
+    
+    if (corruptedFiles.length > 0) {
+      logger.warn(`Corrupted PDFs detected: ${corruptedFiles.join(', ')}`);
+      
+      if (validFiles.length === 0) {
+        await sendErrorEmail(
+          broker.destination_email,
+          'All PDF files are corrupted or invalid.',
+          `Corrupted files: ${corruptedFiles.join(', ')}\n\nPlease check your files and try again.`
+        );
+        return res.status(400).json({ error: 'All PDFs are corrupted' });
+      }
+      
+      // Continue with valid files, notify about corrupted ones
+      logger.info(`Continuing with ${validFiles.length} valid PDFs`);
+    }
     
     try {
       logger.info('Calling Broker API');
       
-      const watermarkResponse = await fetch(process.env.BROKER_API_URL, {
+      const watermarkResponse = await fetchWithTimeout(process.env.BROKER_API_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -277,8 +431,8 @@ app.post('/inbound', async (req, res) => {
         },
         body: JSON.stringify({
           user_email: broker.source_email,
-          files: files,
-          skip_usage_tracking: true // Gateway will track usage instead
+          files: validFiles,
+          skip_usage_tracking: true
         })
       });
       
@@ -314,6 +468,7 @@ app.post('/inbound', async (req, res) => {
       
       const finalFiles = [];
       let totalPageCount = 0;
+      const funderProcessingErrors = [];
       
       if (funderNames.length === 0) {
         // No funders - count broker-watermarked files
@@ -324,51 +479,98 @@ app.post('/inbound', async (req, res) => {
         }
         finalFiles.push(...brokerWatermarkedFiles);
       } else {
-        // With funders - only count the final funder-watermarked files
+        // With funders - add funder watermarks
         for (const file of brokerWatermarkedFiles) {
           const pdfBuffer = Buffer.from(file.Content, 'base64');
           const baseName = file.Name.replace(/\.pdf$/i, '').replace(/-protected$/i, '');
           
           for (const funderName of funderNames) {
-            logger.info(`Adding funder: ${funderName} to ${file.Name}`);
-            
-            const funderPdf = await addFunderWatermark(pdfBuffer, funderName);
-            const funderSlug = funderName.substring(0, MAX_FUNDER_NAME_LENGTH)
-              .replace(/\s+/g, '-').toLowerCase();
-            
-            // Count pages ONLY for funder files
-            const pdfDoc = await PDFDocument.load(funderPdf, { updateMetadata: false });
-            totalPageCount += pdfDoc.getPageCount();
-            
-            finalFiles.push({
-              Name: `${baseName}-${funderSlug}.pdf`,
-              Content: Buffer.from(funderPdf).toString('base64'),
-              ContentType: 'application/pdf'
-            });
+            try {
+              logger.info(`Adding funder: ${funderName} to ${file.Name}`);
+              
+              const funderPdf = await addFunderWatermark(pdfBuffer, funderName);
+              const funderSlug = funderName.substring(0, MAX_FUNDER_NAME_LENGTH)
+                .replace(/\s+/g, '-').toLowerCase();
+              
+              const pdfDoc = await PDFDocument.load(funderPdf, { updateMetadata: false });
+              totalPageCount += pdfDoc.getPageCount();
+              
+              finalFiles.push({
+                Name: `${baseName}-${funderSlug}.pdf`,
+                Content: Buffer.from(funderPdf).toString('base64'),
+                ContentType: 'application/pdf'
+              });
+            } catch (error) {
+              logger.error(`Failed to add funder watermark: ${funderName} to ${file.Name}`, error);
+              funderProcessingErrors.push(`${funderName} on ${file.Name}`);
+            }
           }
         }
       }
       
+      if (finalFiles.length === 0) {
+        throw new Error('No files could be processed successfully');
+      }
+      
       logger.info(`Sending ${finalFiles.length} file(s)`);
       
-      await postmarkClient.sendEmail({
-        From: 'Aquamark <gateway@aquamark.io>',
-        To: broker.destination_email,
-        Subject: funderNames.length > 0 
-          ? `Watermarked Documents - ${funderNames.join(', ')}`
-          : 'Watermarked Documents',
-        TextBody: 'Your watermarked documents are attached.',
-        Attachments: finalFiles
-      });
+      // Attempt to send email with retry
+      let emailSent = false;
+      let emailError = null;
       
-      // Track usage
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          await postmarkClient.sendEmail({
+            From: 'Aquamark <gateway@aquamark.io>',
+            To: broker.destination_email,
+            Subject: funderNames.length > 0 
+              ? `Watermarked Documents - ${funderNames.join(', ')}`
+              : 'Watermarked Documents',
+            TextBody: `Your watermarked documents are attached.${
+              corruptedFiles.length > 0 
+                ? `\n\nNote: The following files were corrupted and skipped: ${corruptedFiles.join(', ')}` 
+                : ''
+            }${
+              funderProcessingErrors.length > 0
+                ? `\n\nWarning: Failed to add watermarks for: ${funderProcessingErrors.join(', ')}`
+                : ''
+            }`,
+            Attachments: finalFiles
+          });
+          
+          emailSent = true;
+          logger.info(`Email sent successfully (attempt ${attempt})`);
+          break;
+        } catch (error) {
+          emailError = error;
+          logger.error(`Email send failed (attempt ${attempt}):`, error.message);
+          
+          if (attempt === 1) {
+            await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2s before retry
+          }
+        }
+      }
+      
+      if (!emailSent) {
+        // Email failed after retries - send error notification
+        await sendErrorEmail(
+          broker.destination_email,
+          'Failed to send watermarked documents after processing.',
+          `Files were processed successfully but email delivery failed. Please contact support@aquamark.io.\n\nError: ${emailError.message}`
+        );
+        throw new Error(`Email delivery failed: ${emailError.message}`);
+      }
+      
+      // Track usage ONLY after successful email delivery
       await trackUsage(broker.source_email, finalFiles.length, totalPageCount);
       
-      logger.info('Email sent successfully');
+      logger.info('Processing complete');
       
       res.json({ 
         success: true, 
-        files_sent: finalFiles.length
+        files_sent: finalFiles.length,
+        corrupted_files_skipped: corruptedFiles.length,
+        funder_errors: funderProcessingErrors.length
       });
       
     } catch (error) {
@@ -377,6 +579,16 @@ app.post('/inbound', async (req, res) => {
         stack: error.stack,
         name: error.name
       });
+      
+      // Send error notification to user
+      if (broker) {
+        await sendErrorEmail(
+          broker.destination_email,
+          'An error occurred while processing your watermark request.',
+          `Error: ${error.message}\n\nPlease try again or contact support@aquamark.io if the issue persists.`
+        );
+      }
+      
       return res.status(500).json({ error: error.message });
     }
     
@@ -388,13 +600,13 @@ app.post('/inbound', async (req, res) => {
 
 async function pollJobCompletion(jobId) {
   let attempts = 0;
-  const maxAttempts = 30;
+  const maxAttempts = 45; // 90 seconds max (45 × 2s)
   
   while (attempts < maxAttempts) {
     await new Promise(resolve => setTimeout(resolve, 2000));
     
     const statusUrl = `${process.env.BROKER_API_URL.replace('/watermark', '')}/job-status/${jobId}`;
-    const statusResponse = await fetch(statusUrl, {
+    const statusResponse = await fetchWithTimeout(statusUrl, {
       headers: { 'Authorization': `Bearer ${process.env.BROKER_API_KEY}` }
     });
     
@@ -411,11 +623,11 @@ async function pollJobCompletion(jobId) {
     attempts++;
   }
   
-  throw new Error('Job timed out');
+  throw new Error('Job timed out after 90 seconds');
 }
 
 async function downloadAndExtractFiles(downloadUrl) {
-  const downloadResponse = await fetch(downloadUrl);
+  const downloadResponse = await fetchWithTimeout(downloadUrl);
   if (!downloadResponse.ok) {
     throw new Error(`Download failed: ${downloadResponse.statusText}`);
   }
@@ -427,6 +639,12 @@ async function downloadAndExtractFiles(downloadUrl) {
     const urlParts = downloadUrl.split('/');
     const filename = urlParts[urlParts.length - 1] || 'document.pdf';
     
+    // Validate the downloaded PDF
+    const isValid = await isValidPDF(Buffer.from(buffer));
+    if (!isValid) {
+      throw new Error('Downloaded file is not a valid PDF');
+    }
+    
     return [{
       Name: filename,
       Content: Buffer.from(buffer).toString('base64'),
@@ -437,13 +655,30 @@ async function downloadAndExtractFiles(downloadUrl) {
   const zip = new AdmZip(Buffer.from(buffer));
   const zipEntries = zip.getEntries();
   
-  return zipEntries
-    .filter(entry => !entry.isDirectory && entry.entryName.toLowerCase().endsWith('.pdf'))
-    .map(entry => ({
-      Name: entry.entryName,
-      Content: entry.getData().toString('base64'),
-      ContentType: 'application/pdf'
-    }));
+  const validPdfs = [];
+  
+  for (const entry of zipEntries) {
+    if (!entry.isDirectory && entry.entryName.toLowerCase().endsWith('.pdf')) {
+      const pdfBuffer = entry.getData();
+      const isValid = await isValidPDF(pdfBuffer);
+      
+      if (isValid) {
+        validPdfs.push({
+          Name: entry.entryName,
+          Content: pdfBuffer.toString('base64'),
+          ContentType: 'application/pdf'
+        });
+      } else {
+        logger.warn(`Skipping invalid PDF from zip: ${entry.entryName}`);
+      }
+    }
+  }
+  
+  if (validPdfs.length === 0) {
+    throw new Error('No valid PDFs found in downloaded archive');
+  }
+  
+  return validPdfs;
 }
 
 async function trackUsage(userEmail, fileCount, pageCount) {
@@ -495,4 +730,6 @@ app.listen(PORT, '0.0.0.0', () => {
   logger.info(`Broker Email Gateway running on port ${PORT}`);
   console.log(`🚀 Aquamark Broker Email Gateway on port ${PORT}`);
   console.log(`📧 Ready at {broker-id}@broker-gateway.aquamark.io`);
+  console.log(`📊 Rate limit: 25 emails per 15 minutes (100/hour)`);
+  console.log(`📦 Max file size: 25MB per file, 25MB total`);
 });
