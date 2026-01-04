@@ -10,7 +10,6 @@ const fetch = require('node-fetch');
 const { PDFDocument } = require('pdf-lib');
 const sharp = require('sharp');
 const AdmZip = require('adm-zip');
-const AbortController = require('abort-controller');
 
 // Initialize logger
 const logger = winston.createLogger({
@@ -254,25 +253,14 @@ async function addFunderWatermark(pdfBuffer, funderName) {
   return await pdfDoc.save({ updateMetadata: false });
 }
 
-// Fetch with timeout
+// Fetch with timeout using Promise.race
 async function fetchWithTimeout(url, options = {}, timeout = FETCH_TIMEOUT) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
-  
-  try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal
-    });
-    clearTimeout(timeoutId);
-    return response;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
-      throw new Error('Request timeout');
-    }
-    throw error;
-  }
+  return Promise.race([
+    fetch(url, options),
+    new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Request timeout')), timeout)
+    )
+  ]);
 }
 
 app.get('/health', (req, res) => {
