@@ -209,49 +209,46 @@ app.post('/inbound', async (req, res) => {
     logger.info('Received inbound email');
     
     const emailData = req.body;
-    const recipientEmail = emailData.ToFull?.[0]?.Email || emailData.To;
     
-    // Extract broker ID from email: bearfinancial@broker-gateway.aquamark.io -> bearfinancial
-    const brokerIdMatch = recipientEmail.match(/^([^@]+)@broker-gateway\.aquamark\.io$/i);
+    // Get TO address (gateway email) and FROM address (original sender)
+    const toEmail = emailData.ToFull?.[0]?.Email || emailData.To;
+    const fromEmail = emailData.From || emailData.FromFull?.Email;
     
-    if (!brokerIdMatch) {
-      logger.error(`Invalid email format: ${recipientEmail}`);
-      return res.status(400).json({ error: 'Invalid email format' });
+    logger.info(`Email from: ${fromEmail} to: ${toEmail}`);
+    
+    // Validate gateway email format
+    if (!toEmail || !toEmail.match(/@broker-gateway\.aquamark\.io$/i)) {
+      logger.error(`Invalid gateway email format: ${toEmail}`);
+      return res.status(400).json({ error: 'Invalid gateway email format' });
     }
     
-    const brokerId = brokerIdMatch[1];
-    logger.info(`Processing for broker: ${brokerId}`);
-    
-    const { data: broker, error: brokerError } = await supabase
-      .from('broker_gateway_users')
+    // Look up the gateway email in users table
+    const { data: user, error: userError } = await supabase
+      .from('users')
       .select('*')
-      .eq('broker_id', brokerId)
-      .eq('active', true)
+      .eq('email', toEmail)
       .single();
     
-    if (brokerError || !broker) {
-      logger.error(`Broker not found: ${brokerId}`);
-      return res.status(404).json({ error: 'Broker not found' });
+    if (userError || !user) {
+      logger.error(`Gateway email not authorized: ${toEmail}`);
+      return res.status(404).json({ error: 'Gateway email not found or not authorized' });
     }
     
-    const senderEmail = emailData.From || emailData.FromFull?.Email;
-    if (senderEmail !== broker.source_email) {
-      logger.warn(`Unauthorized sender: ${senderEmail}`);
-      return res.status(403).json({ error: 'Unauthorized' });
+    logger.info(`Authorized gateway user: ${user.email}`);
+    
+    // Extract funder names from subject line
+    const funderNames = [];
+    if (emailData.Subject) {
+      const match = emailData.Subject.match(/\[(.*?)\]/);
+      if (match) {
+        funderNames.push(...match[1].split(',').map(s => s.trim()).filter(Boolean));
+      }
     }
     
-    logger.info(`Found broker: ${broker.company_name}`);
-    
-    const subject = emailData.Subject || '';
-    const funderNames = subject.trim() 
-      ? subject.split(',').map(f => f.trim()).filter(f => f.length > 0)
-      : [];
-    
-    logger.info(`Funders: ${funderNames.length > 0 ? funderNames.join(', ') : 'none'}`);
-    
-    const attachments = emailData.Attachments || [];
-    const pdfAttachments = attachments.filter(att => 
-      att.Name.toLowerCase().endsWith('.pdf')
+    // Get PDF attachments
+    const pdfAttachments = (emailData.Attachments || []).filter(att => 
+      att.ContentType === 'application/pdf' || 
+      att.Name?.toLowerCase().endsWith('.pdf')
     );
     
     if (pdfAttachments.length === 0) {
@@ -276,7 +273,7 @@ app.post('/inbound', async (req, res) => {
           'Authorization': `Bearer ${process.env.BROKER_API_KEY}`
         },
         body: JSON.stringify({
-          user_email: broker.source_email,
+          user_email: toEmail, // Use gateway email for Broker API authorization
           files: files,
           skip_usage_tracking: true // Gateway will track usage instead
         })
@@ -349,11 +346,12 @@ app.post('/inbound', async (req, res) => {
         }
       }
       
-      logger.info(`Sending ${finalFiles.length} file(s)`);
+      logger.info(`Sending ${finalFiles.length} file(s) to ${fromEmail}`);
       
+      // Send watermarked files back to original sender (FROM address)
       await postmarkClient.sendEmail({
         From: 'Aquamark <gateway@aquamark.io>',
-        To: broker.destination_email,
+        To: fromEmail, // Send back to original sender, not gateway email
         Subject: funderNames.length > 0 
           ? `Watermarked Documents - ${funderNames.join(', ')}`
           : 'Watermarked Documents',
@@ -361,8 +359,8 @@ app.post('/inbound', async (req, res) => {
         Attachments: finalFiles
       });
       
-      // Track usage
-      await trackUsage(broker.source_email, finalFiles.length, totalPageCount);
+      // Track usage by gateway email (the broker identity)
+      await trackUsage(toEmail, finalFiles.length, totalPageCount);
       
       logger.info('Email sent successfully');
       
@@ -485,7 +483,7 @@ async function trackUsage(userEmail, fileCount, pageCount) {
         });
     }
     
-    logger.info(`Usage tracked: ${fileCount} files, ${pageCount} pages`);
+    logger.info(`Usage tracked: ${fileCount} files, ${pageCount} pages for ${userEmail}`);
   } catch (error) {
     logger.error('Usage tracking error:', error.message);
   }
@@ -494,5 +492,5 @@ async function trackUsage(userEmail, fileCount, pageCount) {
 app.listen(PORT, '0.0.0.0', () => {
   logger.info(`Broker Email Gateway running on port ${PORT}`);
   console.log(`🚀 Aquamark Broker Email Gateway on port ${PORT}`);
-  console.log(`📧 Ready at {broker-id}@broker-gateway.aquamark.io`);
+  console.log(`📧 Ready to receive emails at any @broker-gateway.aquamark.io address`);
 });
