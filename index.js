@@ -32,6 +32,9 @@ const logger = winston.createLogger({
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// Trust proxy for rate limiting (Render uses proxy)
+app.set('trust proxy', 1);
+
 // Security and middleware
 app.use(helmet());
 app.use(compression());
@@ -237,19 +240,13 @@ app.post('/inbound', async (req, res) => {
     logger.info(`Authorized gateway user: ${user.email}`);
     
     // Extract funder names from subject line
-    const funderNames = [];
-    if (emailData.Subject) {
-      const match = emailData.Subject.match(/\[(.*?)\]/);
-      if (match) {
-        const funders = match[1].split(',').map(s => s.trim()).filter(Boolean);
-        funderNames.push(...funders);
-        logger.info(`Extracted funders from subject: ${funders.join(', ')}`);
-      }
-    }
+    // Subject line should contain comma-separated funder names: "Funder1, Funder2, Funder3"
+    const subject = emailData.Subject || '';
+    const funderNames = subject.trim() 
+      ? subject.split(',').map(f => f.trim()).filter(f => f.length > 0)
+      : [];
     
-    if (funderNames.length === 0) {
-      logger.info('No funders specified in subject line');
-    }
+    logger.info(`Funders: ${funderNames.length > 0 ? funderNames.join(', ') : 'none'}`);
     
     // Get PDF attachments
     const pdfAttachments = (emailData.Attachments || []).filter(att => 
