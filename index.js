@@ -241,8 +241,14 @@ app.post('/inbound', async (req, res) => {
     if (emailData.Subject) {
       const match = emailData.Subject.match(/\[(.*?)\]/);
       if (match) {
-        funderNames.push(...match[1].split(',').map(s => s.trim()).filter(Boolean));
+        const funders = match[1].split(',').map(s => s.trim()).filter(Boolean);
+        funderNames.push(...funders);
+        logger.info(`Extracted funders from subject: ${funders.join(', ')}`);
       }
+    }
+    
+    if (funderNames.length === 0) {
+      logger.info('No funders specified in subject line');
     }
     
     // Get PDF attachments
