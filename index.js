@@ -426,8 +426,10 @@ async function downloadAndExtractFiles(downloadUrl) {
   
   if (contentType && contentType.includes('application/pdf')) {
     const urlParts = downloadUrl.split('/');
-    const filename = urlParts[urlParts.length - 1] || 'document.pdf';
-    
+    const rawFilename = urlParts[urlParts.length - 1] || 'document.pdf';
+    // Strip any query string (signed URLs include ?token=... etc.)
+    const filename = rawFilename.split('?')[0];
+
     return [{
       Name: filename,
       Content: Buffer.from(buffer).toString('base64'),
