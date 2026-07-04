@@ -203,6 +203,25 @@ async function addFunderWatermark(pdfBuffer, funderName) {
   return await pdfDoc.save({ updateMetadata: false });
 }
 
+// Checks whether a PDF already carries an Aquamark brand watermark
+// (e.g. it arrived pre-watermarked via the intake gateway). Used to
+// avoid stamping the same brand watermark a second time, which stacks
+// diagonal text at identical coordinates and can corrupt OCR/data
+// extraction on the underlying document.
+async function isAlreadyProtected(base64Content) {
+  try {
+    const pdfBuffer = Buffer.from(base64Content, 'base64');
+    const pdfDoc = await PDFDocument.load(pdfBuffer, { updateMetadata: false });
+    const { PDFName } = require('pdf-lib');
+    const infoDict = pdfDoc.getInfoDict();
+    const protectedFlag = infoDict.get(PDFName.of('AquamarkProtected'));
+    return protectedFlag && protectedFlag.toString().includes('true');
+  } catch (error) {
+    logger.warn('Could not check AquamarkProtected metadata:', error.message);
+    return false;
+  }
+}
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'aquamark-broker-gateway' });
 });
@@ -260,58 +279,83 @@ app.post('/inbound', async (req, res) => {
     }
     
     logger.info(`Processing ${pdfAttachments.length} PDF(s)`);
-    
-    const files = pdfAttachments.map(att => ({
+
+    // Split out any files that already carry an Aquamark brand watermark
+    // (e.g. forwarded from the intake gateway) so we don't stamp the
+    // brand watermark a second time at the same coordinates.
+    const alreadyProtected = [];
+    const needsBranding = [];
+    for (const att of pdfAttachments) {
+      if (await isAlreadyProtected(att.Content)) {
+        alreadyProtected.push({ Name: att.Name, Content: att.Content, ContentType: 'application/pdf' });
+      } else {
+        needsBranding.push(att);
+      }
+    }
+    if (alreadyProtected.length > 0) {
+      logger.info(`${alreadyProtected.length} file(s) already brand-watermarked - skipping re-branding`);
+    }
+
+    const files = needsBranding.map(att => ({
       name: att.Name,
       data: att.Content
     }));
-    
+
     try {
-      logger.info('Calling Broker API');
-      
-      const watermarkResponse = await fetch(process.env.BROKER_API_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.BROKER_API_KEY}`
-        },
-        body: JSON.stringify({
-          user_email: toEmail, // Use gateway email for Broker API authorization
-          files: files,
-          skip_usage_tracking: true // Gateway will track usage instead
-        })
-      });
-      
-      if (!watermarkResponse.ok) {
-        const errorText = await watermarkResponse.text();
-        logger.error('Broker API error:', { 
-          status: watermarkResponse.status, 
-          response: errorText.substring(0, 500) 
+      let brokerWatermarkedFiles = [];
+
+      if (files.length > 0) {
+        logger.info('Calling Broker API');
+
+        const watermarkResponse = await fetch(process.env.BROKER_API_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.BROKER_API_KEY}`
+          },
+          body: JSON.stringify({
+            user_email: toEmail, // Use gateway email for Broker API authorization
+            files: files,
+            skip_usage_tracking: true // Gateway will track usage instead
+          })
         });
-        throw new Error(`Broker API failed with status ${watermarkResponse.status}`);
+
+        if (!watermarkResponse.ok) {
+          const errorText = await watermarkResponse.text();
+          logger.error('Broker API error:', {
+            status: watermarkResponse.status,
+            response: errorText.substring(0, 500)
+          });
+          throw new Error(`Broker API failed with status ${watermarkResponse.status}`);
+        }
+
+        const contentType = watermarkResponse.headers.get('content-type');
+        if (!contentType || !contentType.includes('application/json')) {
+          const textResponse = await watermarkResponse.text();
+          logger.error('Broker API returned non-JSON:', {
+            contentType,
+            response: textResponse.substring(0, 500)
+          });
+          throw new Error('Broker API returned invalid response (not JSON)');
+        }
+
+        const result = await watermarkResponse.json();
+        const jobId = result.job_id;
+
+        logger.info(`Job created: ${jobId}, polling for completion`);
+        const downloadUrl = await pollJobCompletion(jobId);
+
+        logger.info(`Job complete, downloading from: ${downloadUrl}`);
+        brokerWatermarkedFiles = await downloadAndExtractFiles(downloadUrl);
+
+        logger.info(`Downloaded ${brokerWatermarkedFiles.length} file(s)`);
       }
-      
-      const contentType = watermarkResponse.headers.get('content-type');
-      if (!contentType || !contentType.includes('application/json')) {
-        const textResponse = await watermarkResponse.text();
-        logger.error('Broker API returned non-JSON:', { 
-          contentType, 
-          response: textResponse.substring(0, 500) 
-        });
-        throw new Error('Broker API returned invalid response (not JSON)');
-      }
-      
-      const result = await watermarkResponse.json();
-      const jobId = result.job_id;
-      
-      logger.info(`Job created: ${jobId}, polling for completion`);
-      const downloadUrl = await pollJobCompletion(jobId);
-      
-      logger.info(`Job complete, downloading from: ${downloadUrl}`);
-      const brokerWatermarkedFiles = await downloadAndExtractFiles(downloadUrl);
-      
-      logger.info(`Downloaded ${brokerWatermarkedFiles.length} file(s)`);
-      
+
+      // Merge freshly brand-watermarked files with ones that already
+      // had a brand watermark - both are now "branded" for the purpose
+      // of any funder watermarking below.
+      brokerWatermarkedFiles = [...brokerWatermarkedFiles, ...alreadyProtected];
+
       const finalFiles = [];
       let totalPageCount = 0;
       
