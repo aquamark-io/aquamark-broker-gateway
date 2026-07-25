@@ -10,17 +10,17 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@supabase/supabase-js": "^2.101.1",
+    "adm-zip": "^0.6.0",
+    "compression": "^1.8.1",
     "cors": "^2.8.6",
     "express": "^5.2.1",
-    "node-fetch": "^2.7.0",
-    "@supabase/supabase-js": "^2.101.1",
-    "winston": "^3.19.0",
-    "helmet": "^8.1.0",
-    "compression": "^1.8.1",
     "express-rate-limit": "^8.3.2",
-    "postmark": "^4.0.7",
-    "adm-zip": "^0.5.17",
+    "helmet": "^8.1.0",
+    "node-fetch": "^2.7.0",
     "pdf-lib": "^1.17.1",
-    "sharp": "^0.34.5"
+    "postmark": "^4.0.7",
+    "sharp": "^0.34.5",
+    "winston": "^3.19.0"
   }
 }
